@@ -13,13 +13,14 @@ DB_PATH = os.environ.get("SCALER_DB", "./scaler.db")
 
 app = FastAPI(
     title="短视频转码副本伸缩模拟器",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         f"每 {VIDEOS_PER_REPLICA} 个待转视频需一个副本（向上取整，至少 {MIN_REPLICAS} 个）。\n\n"
         "- **POST /roster**：值班员更新就绪 Pod 名单（产生新版号并重新累计）\n"
         "- **POST /reports**：监控每轮上报各 Pod 待转数（附轮号和名单版号）\n"
         "- **GET /target**：查询目标副本数及调整原因\n"
-        "- **GET /state /events /roster**：查询累计状态、调整历史、当前名单"
+        "- **GET /state /events /roster**：查询累计状态、调整历史、当前名单\n\n"
+        f"当前实例数据库：`{DB_PATH}`。多个实例可共享同一 SQLite 卷（WAL + 忙等重试）。"
     ),
 )
 scaler = Scaler(DB_PATH)
@@ -34,6 +35,12 @@ class ReportIn(BaseModel):
     round: int = Field(..., ge=1, description="监控轮号")
     pod: str = Field(..., min_length=1, description="Pod 名称")
     pending: int = Field(..., ge=0, description="该 Pod 待转视频数")
+
+
+@app.get("/health", summary="健康检查（实例就绪后可查询）")
+def health():
+    """返回实例所用数据库路径与当前名单版号，便于确认多个实例连的是同一份状态。"""
+    return {"status": "ok", "db": DB_PATH, "roster_version": scaler.get_roster()["roster_version"]}
 
 
 @app.post("/roster", summary="值班员更新就绪 Pod 名单")

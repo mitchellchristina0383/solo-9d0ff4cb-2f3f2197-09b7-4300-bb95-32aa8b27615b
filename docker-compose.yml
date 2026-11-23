@@ -1,5 +1,7 @@
 services:
-  scaler:
+  # 两个实例共享同一个 SQLite 卷，用来验证并发首次启动与接力服务。
+  # 来访入口：http://localhost:8000/docs（scaler-a）、http://localhost:8001/docs（scaler-b）
+  scaler-a:
     build: .
     ports:
       - "8000:8000"
@@ -8,6 +10,30 @@ services:
     volumes:
       - scaler-data:/data
     restart: unless-stopped
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  scaler-b:
+    build: .
+    ports:
+      - "8001:8000"
+    environment:
+      SCALER_DB: /data/scaler.db
+    volumes:
+      - scaler-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
 volumes:
   scaler-data:

@@ -13,12 +13,16 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 
 VIDEOS_PER_REPLICA = 10  # 每 10 个待转视频需一个副本
 MIN_REPLICAS = 1         # 至少留一个
+BUSY_TIMEOUT_MS = 30_000  # 跨进程写锁等待上限
+INIT_ATTEMPTS = 60        # 初始化遇到 database is locked 时的重试次数
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rosters (
@@ -67,34 +71,87 @@ def _suggest(backlog: int) -> int:
 
 
 class Scaler:
-    """副本伸缩状态机。所有写操作在全局锁 + BEGIN IMMEDIATE 事务内完成。"""
+    """副本伸缩状态机。所有写操作在全局锁 + BEGIN IMMEDIATE 事务内完成。
+
+    多个进程（或容器）可指向同一个 DB 文件：写入靠 SQLite 的 BEGIN IMMEDIATE
+    + busy_timeout 串行化，进程内再加线程锁减少锁竞争。
+    """
 
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._lock = threading.Lock()
         directory = os.path.dirname(os.path.abspath(db_path))
         os.makedirs(directory, exist_ok=True)
-        conn = self._connect()
+        self._init_db()
+
+    # ---------------------------------------------------------------- 初始化
+
+    def _init_db(self) -> None:
+        """幂等地建表并补齐初始行，可被多个进程同时、重复、中断后再次执行。
+
+        - 先以 BEGIN IMMEDIATE 建好库文件，避免两个进程同时做 WAL 切换
+          （journal_mode 切换在存在写锁时会直接报 database is locked）。
+        - 建表用 IF NOT EXISTS，种子行用 INSERT OR IGNORE 并在写事务内提交，
+          中途崩溃只会留下可补齐的旧卷，下次启动原地恢复。
+        """
+        deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._init_once()
+                return
+            except sqlite3.OperationalError as exc:
+                if not any(k in str(exc).lower() for k in ("locked", "busy")) \
+                        or attempt >= INIT_ATTEMPTS:
+                    raise
+                # 另一个实例正在首次初始化；短暂退避后重试，最终以 busy_timeout 为准。
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.02 * attempt, 0.2) + random.uniform(0, 0.02))
+
+    def _init_once(self) -> None:
+        conn = sqlite3.connect(self._db_path, timeout=BUSY_TIMEOUT_MS / 1000,
+                               isolation_level=None)
         try:
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            # 先拿写锁建出库文件，把两个进程的“首次创建”串起来。
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("COMMIT")
+            # WAL 切换需要短暂排他锁，且不能在事务内生效；已切换过的库这里只是读。
+            if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            # 建表全部 IF NOT EXISTS，中断后再次执行可原地补齐。
             conn.executescript(_SCHEMA)
-            if conn.execute("SELECT COUNT(*) AS c FROM state").fetchone()["c"] == 0:
-                now = _now()
+            # 种子行与建表分开提交；INSERT OR IGNORE 保证重复初始化/中断恢复都幂等。
+            now = _now()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 conn.execute(
-                    "INSERT INTO rosters(version, pods, created_at) VALUES (0, '[]', ?)", (now,))
+                    "INSERT OR IGNORE INTO rosters(version, pods, created_at) "
+                    "VALUES (0, '[]', ?)", (now,))
                 conn.execute(
-                    "INSERT INTO state(id, target, roster_version, max_round_seen, "
+                    "INSERT OR IGNORE INTO state(id, target, roster_version, max_round_seen, "
                     "last_complete_round, last_suggestion, reason, updated_at) "
                     "VALUES (1, ?, 0, NULL, NULL, NULL, ?, ?)",
                     (MIN_REPLICAS, "初始状态：目标副本数 1", now))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         finally:
             conn.close()
 
     # ---------------------------------------------------------------- 基础
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
+        # 日志模式在初始化时已切到 WAL（数据库级持久设置），请求路径不再做切换，
+        # 避免与其它实例的写事务抢排他锁。
+        conn = sqlite3.connect(self._db_path, timeout=BUSY_TIMEOUT_MS / 1000,
+                               isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         return conn
 
     @staticmethod
